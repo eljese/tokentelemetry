@@ -66,7 +66,7 @@ function parseInvocation(argv) {
 // { help, options }: help is true when -h/--help was seen (the caller prints
 // help and exits 0).
 function parseArgs(argv) {
-  const out = { frontPort: 3000, apiPort: 8000, host: '127.0.0.1', allowedOrigins: '', authToken: '', insecureNoAuth: false, dataDir: null, noOpen: false };
+  const out = { frontPort: 3000, apiPort: 8000, host: '127.0.0.1', allowedOrigins: '', authToken: '', insecureNoAuth: false, dataDir: null, noOpen: false, prod: false };
   const fail = (msg) => { throw new UsageError(msg); };
   const take = (i) => {
     if (i + 1 >= argv.length) fail(`expected a value after ${argv[i]}`);
@@ -96,6 +96,7 @@ function parseArgs(argv) {
     else if (a.startsWith('--auth-token='))    { out.authToken = a.slice('--auth-token='.length); }
     else if (a === '--insecure-no-auth')       { out.insecureNoAuth = true; }
     else if (a === '--no-open')                { out.noOpen = true; }
+    else if (a === '--prod')                   { out.prod = true; }
     else if (a === '-d' || a === '--data-dir') { setDataDir(take(i)); i++; }
     else if (a.startsWith('--data-dir='))      { setDataDir(a.slice('--data-dir='.length)); }
     else fail(`unknown argument: ${a}\nRun with --help for usage.`);
@@ -148,6 +149,13 @@ function printHelp() {
     '                            on a fully trusted private network (e.g. a tailnet).',
     '      --no-open             Do not open the dashboard in a browser. Useful from',
     '                            scripts; AGENT_HARNESS_NO_OPEN still works too.',
+    '      --prod                Run the frontend as a production build (next build',
+    '                            + next start). Use this when the dashboard is',
+    '                            served behind a tunnel / reverse proxy: next dev',
+    '                            opens a WebSocket for hot-reload that proxies',
+    '                            without HTTP/2 streaming often 502 on, and React',
+    '                            hooks silently fail to fire — the dashboard loads',
+    '                            but never fetches data. --prod avoids both.',
     '  -h, --help               Show this help.',
     '',
     'Examples:',
@@ -471,7 +479,7 @@ function ensureFrontend() {
 }
 
 async function start(options) {
-  const { frontPort, apiPort, host, allowedOrigins, authToken, insecureNoAuth, dataDir } = options;
+  const { frontPort, apiPort, host, allowedOrigins, authToken, insecureNoAuth, dataDir, noOpen, prod } = options;
 
   // --data-dir is just a friendly front-end for TOKENTELEMETRY_DATA_DIR, which
   // the Python backend reads (tt_paths.data_dir). An explicit flag wins over an
@@ -533,6 +541,20 @@ async function start(options) {
     : '';
 
   console.log('\n→ launching services…');
+  if (prod) {
+    // Build the production bundle synchronously so the first dashboard load
+    // is served from .next/ rather than waiting on Turbopack to compile on
+    // demand. Skipping the build step would make `next start` lazily compile
+    // the first request — defeating the whole point of --prod for users who
+    // just want the dashboard to work.
+    console.log('→ building production frontend bundle…');
+    const buildRes = spawnSync('npm', ['run', 'build'], {
+      cwd: frontendDir,
+      stdio: 'inherit',
+      shell: true,
+    });
+    if (buildRes.status !== 0) die('frontend build failed — see output above');
+  }
   const backend = spawn(venvPython, ['main.py', '--port', String(apiPort), '--host', host], {
     cwd: backendDir,
     stdio: 'inherit',
@@ -550,11 +572,11 @@ async function start(options) {
     },
   });
 
-  // Next dev otherwise listens on every interface even when the API is
+// Next dev otherwise listens on every interface even when the API is
   // loopback-only. Bind both services to the same explicit host so the default
   // launch is actually localhost-only and remote mode stays opt-in.
   const npmCommand = isWindows ? 'npm.cmd' : 'npm';
-  const frontend = spawn(npmCommand, ['run', 'dev', '--', '--hostname', host, '--port', String(frontPort)], {
+  const frontend = spawn(npmCommand, ['run', prod ? 'start' : 'dev', '--', '--hostname', host, '--port', String(frontPort)], {
     cwd: frontendDir,
     stdio: 'inherit',
     shell: false,

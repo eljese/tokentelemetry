@@ -1347,7 +1347,11 @@ def test_sessions_endpoint_strips_stub_flag(scan_env, monkeypatch):
     # Keep the fire-and-forget history persist away from the real store.
     monkeypatch.setattr(main, "_persist_history_async", lambda data: None)
 
-    data = asyncio.run(main.get_sessions(fresh=True))
+    # limit=0 disables the size cap (returns the full list). It also keeps
+    # the call FastAPI-free: calling get_sessions directly without going
+    # through the router would otherwise leave `limit` as a Query() default,
+    # which can't be compared to int.
+    data = asyncio.run(main.get_sessions(fresh=True, limit=0))
 
     assert data, "expected at least one session from the fixture tree"
     assert all("stub" not in s for s in data)

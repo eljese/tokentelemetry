@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Body, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -172,7 +174,21 @@ def _pid_alive(pid: int) -> bool:
     except (ProcessLookupError, PermissionError, OSError):
         return False
 
-app = FastAPI(title="TokenTelemetry API")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Warm the sessions cache before the API starts answering HTTP requests,
+    so the very first dashboard load is instant (no 6s cold-cache wait).
+
+    `get_sessions_cached` is defined later in this module; the reference is
+    resolved at call time, so this is a safe forward reference."""
+    try:
+        await get_sessions_cached(fresh=True)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("lifespan sessions warmup failed: %s", e)
+    yield
+
+
+app = FastAPI(title="TokenTelemetry API", lifespan=_lifespan)
 
 # Enable CORS for the Next.js frontend.
 #
@@ -8316,7 +8332,14 @@ import logging as _logging
 
 _log = _logging.getLogger("tokentelemetry.cache")
 
-SESSIONS_TTL_SEC = 30.0
+SESSIONS_TTL_SEC = 300.0  # 5 min — was 30s; full scan takes ~6s on 12k sessions, so
+                          # the old 30s TTL meant the 15s polling rescan-blocked the
+                          # dashboard every other refresh. 5 min keeps the cache hot
+                          # while still picking up new sessions within a reasonable
+                          # window. A half-life proactive refresh keeps the next TTL
+                          # boundary from stalling, and cold-start is warmed in the
+                          # background at app startup so the first dashboard load is
+                          # instant.
 
 _sessions_cache: Dict[str, Any] = {"data": None, "at": 0.0, "building": False}
 _sessions_lock: Optional[_asyncio.Lock] = None  # lazy-init inside event loop
@@ -8327,6 +8350,36 @@ def _get_sessions_lock() -> _asyncio.Lock:
     if _sessions_lock is None:
         _sessions_lock = _asyncio.Lock()
     return _sessions_lock
+
+
+def _schedule_background_rebuild() -> None:
+    """Kick off a fresh scan without blocking the caller. Safe to call
+    repeatedly — if a scan is already in flight, the call is a no-op."""
+    if _sessions_cache.get("building"):
+        return
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        # No event loop (e.g. called from a sync context) — bail; next
+        # request will retry.
+        return
+    _sessions_cache["building"] = True
+    loop.create_task(_background_rebuild())
+
+
+async def _background_rebuild() -> None:
+    try:
+        t0 = _time.monotonic()
+        data = await _asyncio.to_thread(_scan_sessions_sync)
+        _sessions_cache["data"] = data
+        _sessions_cache["at"] = _time.monotonic()
+        _log.info("sessions background scan: %d entries in %.0fms",
+                  len(data), (_time.monotonic() - t0) * 1000)
+        _persist_history_async(data)
+    except Exception as e:  # noqa: BLE001
+        _log.exception("background sessions scan failed: %s", e)
+    finally:
+        _sessions_cache["building"] = False
 
 
 def _archive_opted_in_transcripts(data: List[Dict[str, Any]]) -> None:
@@ -8434,60 +8487,107 @@ def _report_harness_scan(data: List[Dict[str, Any]]) -> None:
 
 
 async def get_sessions_cached(fresh: bool = False) -> List[Dict[str, Any]]:
-    """Cached, non-blocking access to the session list.
+    """Cached access to the session list.
 
-    - TTL is SESSIONS_TTL_SEC (default 30s).
-    - Scans run in a worker thread so the async event loop stays responsive.
-    - Single-flight: concurrent callers share one scan via an asyncio.Lock.
-    - `fresh=True` forces a re-scan.
+    Three paths:
+
+    1. **Cold cache** (`data is None`): the first caller waits for a
+       synchronous scan (one-time, ~6s for 12k sessions). Concurrent callers
+       share that single scan via the asyncio lock, so we don't pile up
+       duplicate scans on the first dashboard load.
+    2. **Warm cache within TTL**: returns immediately. If the cache is past
+       50% of its TTL a fresh scan is scheduled in the background so the
+       next TTL boundary finds a hot cache instead of stalling.
+    3. **Warm cache past TTL, fresh=False**: returns the *previous* list
+       immediately (stale-while-revalidate) and schedules a background
+       rebuild. The user never blocks on a rescan.
+    4. **`fresh=True`**: synchronous rebuild under the lock — used by the
+       manual refresh button. Other in-flight scans wait their turn.
     """
     now = _time.monotonic()
     cached = _sessions_cache.get("data")
     age = now - _sessions_cache.get("at", 0.0)
-    if not fresh and cached is not None and age < SESSIONS_TTL_SEC:
+
+    # Cold cache — first caller does the synchronous scan.
+    if cached is None:
+        async with _get_sessions_lock():
+            # Re-check under the lock: another caller may have warmed it.
+            cached = _sessions_cache.get("data")
+            if cached is not None:
+                return cached
+            _sessions_cache["building"] = True
+            try:
+                t0 = _time.monotonic()
+                data = await _asyncio.to_thread(_scan_sessions_sync)
+                _sessions_cache["data"] = data
+                _sessions_cache["at"] = _time.monotonic()
+                _log.info("sessions cold-start scan: %d entries in %.0fms",
+                          len(data), (_time.monotonic() - t0) * 1000)
+                _persist_history_async(data)
+            except Exception as e:  # noqa: BLE001
+                _log.exception("sessions cold-start scan failed: %s", e)
+                raise
+            finally:
+                _sessions_cache["building"] = False
+            return _sessions_cache["data"]
+
+    # Warm cache — fast path.
+    if not fresh and age < SESSIONS_TTL_SEC:
+        # Proactive refresh at half-life so the next TTL boundary is hot.
+        if age > SESSIONS_TTL_SEC * 0.5:
+            _schedule_background_rebuild()
         return cached
 
-    lock = _get_sessions_lock()
-    async with lock:
-        # Double-check: another waiter may have just refreshed the cache.
-        now = _time.monotonic()
-        cached = _sessions_cache.get("data")
-        age = now - _sessions_cache.get("at", 0.0)
-        if not fresh and cached is not None and age < SESSIONS_TTL_SEC:
-            return cached
+    # Warm cache past TTL — stale-while-revalidate.
+    if not fresh:
+        _schedule_background_rebuild()
+        return cached
 
+    # fresh=True — synchronous rebuild (single-flight via the lock).
+    async with _get_sessions_lock():
         _sessions_cache["building"] = True
         try:
             t0 = _time.monotonic()
             data = await _asyncio.to_thread(_scan_sessions_sync)
             _sessions_cache["data"] = data
             _sessions_cache["at"] = _time.monotonic()
-            _log.info("sessions scan: %d entries in %.0fms", len(data), (_time.monotonic() - t0) * 1000)
+            _log.info("sessions forced scan: %d entries in %.0fms",
+                      len(data), (_time.monotonic() - t0) * 1000)
             _report_harness_scan(data)
             # Durable rollup: persist a tiny summary of each session so history
             # outlives the agents' own transcript pruning. Fire-and-forget on a
             # worker thread — a store failure must never break a request, and the
             # write must not add latency to this scan.
             _persist_history_async(data)
-        except Exception as e:
-            _log.exception("sessions scan failed: %s", e)
-            # If we have a previous value, keep serving it rather than 500-ing.
-            if cached is not None:
-                return cached
-            raise
+        except Exception as e:  # noqa: BLE001
+            _log.exception("sessions forced scan failed: %s", e)
+            # Keep serving the previous list rather than 500-ing.
+            return _sessions_cache["data"] or []
         finally:
             _sessions_cache["building"] = False
         return _sessions_cache["data"]
 
 
 @app.get("/sessions")
-async def get_sessions(fresh: bool = False):
-    """Return the session list. Pass ?fresh=1 to force a re-scan."""
+async def get_sessions(
+    fresh: bool = Query(False, description="Pass fresh=1 to force a re-scan."),
+    limit: int = Query(200, description="Cap response at the most recent N sessions (default 200). Set 0 for the full list — note this can be tens of MB and take seconds to serialise, so only use 0 for offline export."),
+):
+    """Return the session list, newest first by default.
+
+    `stub` is scan→persist plumbing (history_store.upsert_sessions keys its
+    conflict clause on it), not API surface — strip it on shallow copies so
+    we never mutate the cached dicts (the async history persist may still be
+    reading them).
+    """
     data = await get_sessions_cached(fresh=fresh)
-    # `stub` is scan→persist plumbing (history_store.upsert_sessions keys its
-    # conflict clause on it), not API surface. Strip it on shallow copies —
-    # never mutate the cached dicts, which the async history persist may
-    # still be reading.
+    if limit and limit > 0:
+        # Cache stores entries in scan order; sessions are appended as discovered
+        # across agents, so the order isn't strictly time-sorted. Sort by
+        # timestamp desc (empty/missing values sort last) and keep the newest N.
+        def _ts(s: Dict[str, Any]) -> str:
+            return s.get("timestamp") or ""
+        return [{k: v for k, v in s.items() if k != "stub"} for s in sorted(data, key=_ts, reverse=True)[:limit]]
     return [{k: v for k, v in s.items() if k != "stub"} for s in data]
 
 
